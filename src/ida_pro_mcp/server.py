@@ -436,6 +436,13 @@ def ida_get_active_instance() -> dict:
 # List of local management tool names
 LOCAL_TOOLS = {"ida_list_instances", "ida_select_instance", "ida_get_active_instance"}
 
+# Plugin-side instance tools that duplicate the proxy's LOCAL_TOOLS. The plugin's
+# select_instance can't actually reroute the proxy (selection lives here), so it
+# only confuses the agent -- hide them from the merged tool list. Per-call routing
+# via the injected `instance` field + the ida_* tools cover everything. open_file
+# (launches a NEW instance) is distinct and kept.
+REDUNDANT_PLUGIN_TOOLS = {"list_instances", "select_instance"}
+
 dispatch_original = mcp.registry.dispatch
 
 
@@ -543,6 +550,8 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
             try:
                 ida_response = proxy_to_ida(request, target[0], target[1])
                 ida_tools = ida_response.get("result", {}).get("tools", []) if ida_response else []
+                # Drop plugin-side instance tools that duplicate the proxy's own.
+                ida_tools = [t for t in ida_tools if t.get("name") not in REDUNDANT_PLUGIN_TOOLS]
                 # Advertise the optional per-call `instance` routing field on every
                 # proxied tool so agents can target an instance inline.
                 for t in ida_tools:

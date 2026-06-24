@@ -429,9 +429,17 @@ def server_warmup(
 @tool
 @idasync
 def lookup_funcs(
-    queries: Annotated[list[str] | str, "Address(es) or name(s)"],
+    queries: Annotated[list[str] | str, "Address(es), exact/mangled name(s), or a unique name substring"],
 ) -> list[LookupFuncResult]:
-    """Get functions by address or name (auto-detects)"""
+    """Resolve functions by address, exact/mangled name, or unique substring.
+
+    Per query the resolution order is: 0x<ea> / sub_<ea> -> exact symbol
+    (get_name_ea) -> case-insensitive substring over function names. A substring
+    that matches exactly one function resolves to it; multiple matches return an
+    'Ambiguous' error listing candidates (use list_funcs to browse, or pass an
+    exact/mangled name). C++ methods are stored mangled, so a bare name like
+    'SetLocalPlayerIsResolvable' only resolves via this substring fallback.
+    """
     queries = normalize_list_input(queries)
 
     # Treat empty/"*" as "all functions" - but add limit
@@ -443,15 +451,48 @@ def lookup_funcs(
                 break
         return [{"query": "*", "fn": fn, "error": None} for fn in all_funcs]
 
+    # Lazily built (ea, name) index, shared across queries and only built if a
+    # substring fallback is actually needed.
+    fn_index: list[tuple[int, str]] | None = None
+
+    def substring_matches(needle: str) -> list[tuple[int, str]]:
+        nonlocal fn_index
+        if fn_index is None:
+            fn_index = [
+                (ea, ida_funcs.get_func_name(ea) or "") for ea in idautils.Functions()
+            ]
+        nl = needle.lower()
+        return [(ea, nm) for ea, nm in fn_index if nl in nm.lower()]
+
     results = []
     for query in queries:
         try:
             # Fast path: 0x<ea> or sub_<ea>
             ea = _parse_func_query(query)
 
-            # Slow path: name lookup
+            # Exact symbol (stored/mangled name)
             if ea == idaapi.BADADDR:
                 ea = idaapi.get_name_ea(idaapi.BADADDR, query)
+
+            # Substring fallback (handles bare/demangled C++ method names)
+            if ea == idaapi.BADADDR:
+                hits = substring_matches(query)
+                if len(hits) == 1:
+                    ea = hits[0][0]
+                elif len(hits) > 1:
+                    listing = ", ".join(f"{nm} @ {hex(a)}" for a, nm in hits[:10])
+                    suffix = " ..." if len(hits) > 10 else ""
+                    results.append(
+                        {
+                            "query": query,
+                            "fn": None,
+                            "error": (
+                                f"Ambiguous: {len(hits)} matches -- {listing}{suffix}. "
+                                f"Use an exact/mangled name, an address, or list_funcs."
+                            ),
+                        }
+                    )
+                    continue
 
             if ea != idaapi.BADADDR:
                 func = get_function(ea, raise_error=False)
