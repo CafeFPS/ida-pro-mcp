@@ -19,10 +19,14 @@ NETNODE_DESCRIPTION = "$ ida_mcp.description"
 
 
 def _get_autostart() -> bool:
-    """Read the autostart preference from the IDB. Defaults to True."""
+    """Read the autostart preference from the IDB. Defaults to False.
+
+    Manual start/stop via the Ctrl+Alt+M toggle is the fork default; autostart
+    only kicks in if the user explicitly enables it in MCP Configuration.
+    """
     node = ida_netnode.netnode(NETNODE_AUTOSTART)
     val = node.altval(0)  # 0 = not set, 1 = off, 2 = on
-    return val != 1
+    return val == 2
 
 
 def _set_autostart(enabled: bool):
