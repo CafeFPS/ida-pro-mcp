@@ -243,9 +243,9 @@ class MCP(idaapi.plugin_t):
         # HACK: ensure fresh load of ida_mcp package
         unload_package("ida_mcp")
         if TYPE_CHECKING:
-            from .ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, set_local_instance
+            from .ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches, set_local_instance
         else:
-            from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, set_local_instance
+            from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches, set_local_instance
 
         port = self.port
         max_port = port + 100
@@ -258,6 +258,16 @@ class MCP(idaapi.plugin_t):
                 self.mcp = MCP_SERVER
                 set_local_instance(self.host, port)
                 self._register_instance(port)
+                # Warm the strings cache AFTER the server is bound and listening on
+                # its own thread, so find_regex is hot from the first call without
+                # delaying startup or the proxy's first connect. Upstream c25459b
+                # removed the original on-load build because it ran BEFORE serve()
+                # and tripped the proxy warmup timeout; positioning it here keeps
+                # the instant-startup win while restoring the warm cache.
+                try:
+                    init_caches()
+                except Exception as e:
+                    print(f"[MCP] Cache init failed: {e}")
                 return
             except OSError as e:
                 if e.errno in (48, 98, 10048):  # Address already in use
