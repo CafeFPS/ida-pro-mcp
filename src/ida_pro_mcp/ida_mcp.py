@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 NETNODE_AUTOSTART = "$ ida_mcp.autostart"
+NETNODE_DESCRIPTION = "$ ida_mcp.description"
 
 
 def _get_autostart() -> bool:
@@ -28,6 +29,33 @@ def _set_autostart(enabled: bool):
     """Persist the autostart preference into the IDB."""
     node = ida_netnode.netnode(NETNODE_AUTOSTART, 0, True)
     node.altset(0, 1 if not enabled else 2)
+
+
+def _default_description() -> str:
+    """Fallback label when the user has not set one: the root filename."""
+    try:
+        import ida_nalt
+
+        return ida_nalt.get_root_filename() or "Unknown Binary"
+    except Exception:
+        return "Unknown Binary"
+
+
+def _get_description() -> str:
+    """Read the per-IDB MCP instance description. Defaults to the root filename.
+
+    This label disambiguates instances that share a root filename (e.g.
+    several r5apex.exe IDBs from different seasons) in ida_list_instances.
+    """
+    node = ida_netnode.netnode(NETNODE_DESCRIPTION)
+    val = node.supstr(0)
+    return val if val else _default_description()
+
+
+def _set_description(description: str):
+    """Persist the per-IDB MCP instance description into the IDB."""
+    node = ida_netnode.netnode(NETNODE_DESCRIPTION, 0, True)
+    node.supset(0, description)
 
 
 def unload_package(package_name: str):
@@ -48,12 +76,13 @@ CONFIG_ACTION_LABEL = "MCP Configuration"
 class MCPConfigForm(idaapi.Form):
     """Form to configure MCP server host and port."""
 
-    def __init__(self, host: str, port: int, autostart: bool):
+    def __init__(self, host: str, port: int, autostart: bool, description: str):
         form_str = r"""STARTITEM 0
 MCP Server Configuration
 
 <Host:{host}>
 <Port:{port}>
+<Description:{description}>
 <Autostart server when IDA opens:{autostart}>{checks}>
 """
         super().__init__(
@@ -61,6 +90,7 @@ MCP Server Configuration
             {
                 "host": idaapi.Form.StringInput(value=host),
                 "port": idaapi.Form.NumericInput(value=port, tp=idaapi.Form.FT_DEC),
+                "description": idaapi.Form.StringInput(value=description),
                 "checks": idaapi.Form.ChkGroupControl(("autostart",), value=1 if autostart else 0),
             },
         )
@@ -75,8 +105,11 @@ class MCPConfigHandler(idaapi.action_handler_t):
         old_host = self.plugin.host
         old_port = self.plugin.port
         old_autostart = self.plugin.autostart
+        old_description = _get_description()
 
-        form = MCPConfigForm(self.plugin.host, self.plugin.port, self.plugin.autostart)
+        form = MCPConfigForm(
+            self.plugin.host, self.plugin.port, self.plugin.autostart, old_description
+        )
         form.Compile()
         ok = form.Execute()
         if ok != 1:
@@ -86,6 +119,7 @@ class MCPConfigHandler(idaapi.action_handler_t):
         host = form.host.value
         port = form.port.value
         autostart = bool(form.checks.value & 1)
+        description = (form.description.value or "").strip()
         form.Free()
 
         if port < 1 or port > 65535:
@@ -97,9 +131,17 @@ class MCPConfigHandler(idaapi.action_handler_t):
             _set_autostart(autostart)
             print(f"[MCP] Autostart {'enabled' if autostart else 'disabled'}")
 
+        description_changed = description != old_description and description != ""
+        if description_changed:
+            _set_description(description)
+            print(f"[MCP] Description set: {description}")
+
         if host == old_host and port == old_port:
-            if autostart == old_autostart:
+            if autostart == old_autostart and not description_changed:
                 print(f"[MCP] Configuration unchanged: {host}:{port}")
+            elif description_changed and self.plugin.mcp is not None:
+                # Re-register so the new label is reflected in discovery.
+                self.plugin.run(0)
             return 1
 
         self.plugin.host = host
@@ -235,15 +277,19 @@ class MCP(idaapi.plugin_t):
             import ida_nalt
             binary = ida_nalt.get_root_filename() or ""
             idb_path = idc.get_idb_path() or ""
+            input_file = ida_nalt.get_input_file_path() or ""
+            description = _get_description()
             file_path = register_instance(
                 host=self.host,
                 port=port,
                 pid=os.getpid(),
                 binary=binary,
                 idb_path=idb_path,
+                description=description,
+                input_file=input_file,
             )
             self._registered_port = port
-            print(f"[MCP] Registered instance: {binary} (pid={os.getpid()}, port={port})")
+            print(f"[MCP] Registered instance: {description} (pid={os.getpid()}, port={port})")
             print(f"  Discovery file: {file_path}")
         except Exception as e:
             import traceback

@@ -548,7 +548,15 @@ def list_funcs(
 ) -> list[Page[Function]]:
     """List functions with optional filtering and offset/count pagination."""
     queries = normalize_dict_list(queries)
-    all_functions = [get_function(addr) for addr in idautils.Functions()]
+
+    # Hydrating a full Function object for every function in the database before
+    # filtering is O(N x heavy) and times out on large binaries (e.g. r5apex).
+    # Instead build cheap (ea, name) records ONCE, filter/paginate on those, and
+    # hydrate the full object only for the small page that is actually returned.
+    name_records = [
+        {"ea": ea, "name": ida_funcs.get_func_name(ea) or "<unnamed>"}
+        for ea in idautils.Functions()
+    ]
 
     results = []
     for query in queries:
@@ -560,8 +568,11 @@ def list_funcs(
         if filter_pattern in ("", "*"):
             filter_pattern = ""
 
-        filtered = pattern_filter(all_functions, filter_pattern, "name")
-        results.append(paginate(filtered, offset, count))
+        filtered = pattern_filter(name_records, filter_pattern, "name")
+        page = paginate(filtered, offset, count)
+        # Hydrate only the returned slice.
+        page["data"] = [get_function(rec["ea"]) for rec in page["data"]]
+        results.append(page)
 
     return results
 

@@ -5,7 +5,9 @@ import shutil
 import argparse
 import http.client
 import tempfile
+import threading
 import time
+import logging
 import traceback
 import tomllib
 import tomli_w
@@ -17,20 +19,41 @@ import glob
 if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import McpServer
     from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
+    from ida_pro_mcp.ida_mcp.discovery import is_pid_alive
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
     from zeromcp import McpServer
     from zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
+    from discovery import is_pid_alive
 
     sys.path.pop(0)  # Clean up
+
+log = logging.getLogger("ida-pro-mcp")
 
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
 
-# Dynamic instance discovery
+# Dynamic instance discovery. This path/schema is the single canonical
+# contract shared with the IDA plugin's discovery.py -- keep them in sync.
 INSTANCES_DIR = os.path.join(os.path.expanduser("~"), ".ida-mcp", "instances")
-ACTIVE_INSTANCE: int | None = None  # Port number of active instance
+
+# Selection state. ACTIVE_INSTANCE is the chosen port; ACTIVE_EXPLICIT is True
+# only when chosen via ida_select_instance. An explicitly chosen instance is
+# NEVER silently rerouted to a different binary if it goes offline (that would
+# land renames/patches on the wrong IDB). Guarded by _STATE_LOCK so the value
+# is coherent under any concurrent access (HTTP transport / SSE keepalive).
+ACTIVE_INSTANCE: int | None = None
+ACTIVE_EXPLICIT: bool = False
+_STATE_LOCK = threading.RLock()
 LEGACY_MODE = False  # True when --ida-rpc is explicitly provided
+
+# Per-tool-call proxy timeout. Heavy decompiles / full analysis can exceed the
+# old 30s and would otherwise surface to the agent as a dropped request.
+PROXY_TIMEOUT = float(os.environ.get("IDA_MCP_PROXY_TIMEOUT", "180"))
+# Bounded retries for the connection-refused window (IDA plugin restarting).
+# Only connection-establishment failures are retried -- never a request that may
+# have already reached IDA, so write tools cannot be double-applied.
+PROXY_CONNECT_RETRIES = int(os.environ.get("IDA_MCP_PROXY_RETRIES", "2"))
 
 
 class InstanceInfo(TypedDict):
@@ -74,41 +97,76 @@ def check_instance_online_cached(host: str, port: int) -> bool:
     return online
 
 
-def discover_instances() -> dict[int, InstanceInfo]:
-    """Read all instance files from ~/.ida-mcp/instances/
+def _normalize_description(info: InstanceInfo, port: int) -> None:
+    """Ensure a usable label exists regardless of which plugin version wrote
+    the file (older writes ``description``, the unified schema writes both)."""
+    if not info.get("description"):
+        info["description"] = (
+            info.get("binary")  # type: ignore[typeddict-item]
+            or os.path.basename(info.get("idb_path") or "")
+            or f"instance:{port}"
+        )
 
-    Pings are cached (3s TTL) and executed in parallel on cache miss
-    to avoid blocking the STDIO event loop for N seconds with N instances.
+
+def _read_registry() -> dict[int, InstanceInfo]:
+    """Read instance files from ~/.ida-mcp/instances/, dropping dead-PID ghosts.
+
+    Pure filesystem work -- NO network pings -- so it is always fast and bounded
+    regardless of how many stale entries are present. Files whose owning process
+    is gone are deleted here (and evicted from the online cache) so they stop
+    inflating every later ping fan-out.
     """
     instances: dict[int, InstanceInfo] = {}
     if not os.path.exists(INSTANCES_DIR):
         return instances
 
-    # Phase 1: read all JSON files (fast, no I/O blocking)
     for filename in os.listdir(INSTANCES_DIR):
-        if not filename.endswith(".json"):
+        if not filename.endswith(".json") or filename.startswith("."):
             continue
         filepath = os.path.join(INSTANCES_DIR, filename)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 info: InstanceInfo = json.load(f)
-            port = info["port"]
-            instances[port] = info
-        except (json.JSONDecodeError, KeyError, IOError):
+            port = int(info["port"])
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, IOError):
             continue
 
+        pid = info.get("pid")
+        if isinstance(pid, int) and not is_pid_alive(pid):
+            try:
+                os.unlink(filepath)
+            except OSError:
+                pass
+            with _STATE_LOCK:
+                _ONLINE_CACHE.pop(port, None)
+            log.info(
+                "discovery: removed stale instance port=%s pid=%s (%s)",
+                port, pid, info.get("description"),
+            )
+            continue
+
+        _normalize_description(info, port)
+        instances[port] = info
+
+    return instances
+
+
+def discover_instances() -> dict[int, InstanceInfo]:
+    """Registry read + online status. Pings are cached (3s TTL) and executed in
+    parallel on cache miss so the STDIO loop is never blocked for N seconds."""
+    instances = _read_registry()
     if not instances:
         return instances
 
-    # Phase 2: check online status (parallel, cached)
     now = time.monotonic()
     needs_ping: list[tuple[int, InstanceInfo]] = []
-    for port, info in instances.items():
-        cached = _ONLINE_CACHE.get(port)
-        if cached and (now - cached[0]) < _ONLINE_CACHE_TTL:
-            info["online"] = cached[1]
-        else:
-            needs_ping.append((port, info))
+    with _STATE_LOCK:
+        for port, info in instances.items():
+            cached = _ONLINE_CACHE.get(port)
+            if cached and (now - cached[0]) < _ONLINE_CACHE_TTL:
+                info["online"] = cached[1]
+            else:
+                needs_ping.append((port, info))
 
     if needs_ping:
         with ThreadPoolExecutor(max_workers=len(needs_ping)) as pool:
@@ -122,14 +180,20 @@ def discover_instances() -> dict[int, InstanceInfo]:
                     online = future.result()
                 except Exception:
                     online = False
-                _ONLINE_CACHE[port] = (time.monotonic(), online)
+                with _STATE_LOCK:
+                    _ONLINE_CACHE[port] = (time.monotonic(), online)
                 info["online"] = online
 
     return instances
 
 
 def get_target_instance() -> tuple[str, int] | None:
-    """Get host and port of the instance to route requests to."""
+    """Resolve the instance to route a request to.
+
+    Returns None when there is no usable target. Crucially, an *explicitly*
+    selected instance that has gone offline returns None rather than silently
+    rerouting to a different binary -- see _no_target_error_message for why.
+    """
     global ACTIVE_INSTANCE
 
     if LEGACY_MODE:
@@ -139,19 +203,120 @@ def get_target_instance() -> tuple[str, int] | None:
     if not instances:
         return None
 
-    # Use active instance if set and still exists and online
-    if ACTIVE_INSTANCE and ACTIVE_INSTANCE in instances:
-        info = instances[ACTIVE_INSTANCE]
-        if info.get("online", False):
-            return (info["host"], ACTIVE_INSTANCE)
+    with _STATE_LOCK:
+        active = ACTIVE_INSTANCE
+        explicit = ACTIVE_EXPLICIT
 
-    # Auto-select first online instance
+    if active and active in instances and instances[active].get("online", False):
+        return (instances[active]["host"], active)
+
+    # Explicitly selected but unavailable: do NOT rebind to another binary.
+    if explicit:
+        return None
+
+    # Auto mode only: fall back to the first online instance.
     for port, info in sorted(instances.items()):
         if info.get("online", False):
-            ACTIVE_INSTANCE = port
+            with _STATE_LOCK:
+                ACTIVE_INSTANCE = port
             return (info["host"], port)
 
     return None
+
+
+def _no_target_error_message() -> str:
+    """Human-readable reason there is no routable instance, distinguishing an
+    explicit-but-offline selection (data-safety guard) from 'nothing running'."""
+    shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
+    with _STATE_LOCK:
+        active = ACTIVE_INSTANCE
+        explicit = ACTIVE_EXPLICIT
+    if explicit and active:
+        info = _read_registry().get(active)
+        if info is None:
+            return (
+                f"The selected IDA instance on port {active} is no longer registered "
+                f"(the IDB was likely closed). Use ida_list_instances then "
+                f"ida_select_instance to choose another."
+            )
+        return (
+            f"The selected IDA instance '{info.get('description')}' on port {active} "
+            f"is offline. Because it was explicitly selected, requests are NOT "
+            f"auto-routed to a different binary (that would corrupt the wrong IDB). "
+            f"Restart that IDA's MCP server, or use ida_select_instance to switch."
+        )
+    return (
+        f"No IDA instances available. Open IDA and press {shortcut} to start the "
+        f"MCP server."
+    )
+
+
+def _instances_brief(instances: dict[int, InstanceInfo]) -> str:
+    """Compact 'port (description) [online]' listing for error messages."""
+    parts = []
+    for port, info in sorted(instances.items()):
+        state = "online" if info.get("online", False) else "offline"
+        parts.append(f"{port} ({info.get('description')}) [{state}]")
+    return ", ".join(parts) if parts else "(none)"
+
+
+def resolve_instance(spec) -> tuple[tuple[str, int] | None, str | None]:
+    """Resolve a PER-CALL instance spec to a (host, port) target.
+
+    `spec` may be a port (int or numeric string) or a case-insensitive
+    description/binary substring (e.g. "s21"). Returns ((host, port), None) on
+    success, or (None, error_message). Does NOT mutate ACTIVE_INSTANCE -- routing
+    is per request, so concurrent agents never clobber each other's selection.
+    """
+    instances = discover_instances()
+    if not instances:
+        return None, _no_target_error_message()
+
+    port: int | None = None
+    if isinstance(spec, bool):  # guard: bool is an int subclass
+        return None, f"Invalid instance specifier: {spec!r}"
+    if isinstance(spec, int):
+        port = spec
+    elif isinstance(spec, str) and spec.strip().isdigit():
+        port = int(spec.strip())
+
+    if port is not None:
+        info = instances.get(port)
+        if info is None:
+            return None, f"No IDA instance registered on port {port}. Available: {_instances_brief(instances)}"
+        if not info.get("online", False):
+            return None, f"IDA instance on port {port} ('{info.get('description')}') is offline. Available: {_instances_brief(instances)}"
+        return (info["host"], port), None
+
+    needle = str(spec).strip().lower()
+    if not needle:
+        return None, "Empty instance specifier."
+    matches = [
+        (p, i)
+        for p, i in instances.items()
+        if i.get("online", False)
+        and (needle in (i.get("description") or "").lower()
+             or needle in (i.get("binary") or "").lower())
+    ]
+    if not matches:
+        return None, f"No online IDA instance matches '{spec}'. Available: {_instances_brief(instances)}"
+    if len(matches) > 1:
+        cand = ", ".join(f"{p} ({i.get('description')})" for p, i in sorted(matches))
+        return None, f"Instance '{spec}' is ambiguous -- matches: {cand}. Use a port number or a more specific substring."
+    p, i = matches[0]
+    return (i["host"], p), None
+
+
+# Optional per-call routing field injected into every proxied tool's schema so
+# an agent can target an instance inline instead of calling ida_select_instance.
+INSTANCE_SCHEMA_PROP = {
+    "type": "string",
+    "description": (
+        "Optional: target IDA instance for THIS call -- a port number "
+        "(e.g. '13338') or a description/binary substring (e.g. 's21'). "
+        "Omit to use the selected/auto instance. Use ida_list_instances to see options."
+    ),
+}
 
 
 mcp = McpServer("ida-pro-mcp")
@@ -163,12 +328,14 @@ def ida_list_instances() -> list[InstanceInfo]:
     """List all registered IDA instances with their status.
     Returns instances with description, port, idb_path, and online status.
     Use ida_select_instance to switch between instances."""
-    global ACTIVE_INSTANCE
     instances = discover_instances()
     result: list[InstanceInfo] = []
 
     if not instances:
         return result
+
+    with _STATE_LOCK:
+        active = ACTIVE_INSTANCE
 
     first_online_port = None
     for port, info in sorted(instances.items()):
@@ -177,8 +344,8 @@ def ida_list_instances() -> list[InstanceInfo]:
 
     for port, info in sorted(instances.items()):
         # Mark as active if explicitly selected or auto-selected (first online)
-        if ACTIVE_INSTANCE is not None:
-            info["active"] = (port == ACTIVE_INSTANCE)
+        if active is not None:
+            info["active"] = (port == active)
         else:
             info["active"] = (port == first_online_port)
         result.append(info)
@@ -191,41 +358,59 @@ def ida_select_instance(
 ) -> dict:
     """Select which IDA instance to use for subsequent tool calls.
     Use ida_list_instances first to see available instances."""
-    global ACTIVE_INSTANCE
-    instances = discover_instances()
+    global ACTIVE_INSTANCE, ACTIVE_EXPLICIT
+
+    # Bounded: read the registry (filesystem only) and probe ONLY the requested
+    # port. We never fan-out ping every (possibly dead) instance here, so this
+    # tool cannot hang on N stale entries.
+    instances = _read_registry()
 
     if port not in instances:
-        available = list(instances.keys())
-        return {"error": f"Instance on port {port} not found", "available_ports": available}
-
-    info = instances[port]
-    if not info.get("online", False):
         return {
-            "error": f"Instance on port {port} is offline",
-            "description": info.get("description", "Unknown")
+            "error": f"Instance on port {port} not found",
+            "available_ports": sorted(instances.keys()),
         }
 
-    ACTIVE_INSTANCE = port
+    info = instances[port]
+    online = check_instance_online(info["host"], port)
+    with _STATE_LOCK:
+        _ONLINE_CACHE[port] = (time.monotonic(), online)
+
+    if not online:
+        return {
+            "error": f"Instance on port {port} is offline",
+            "description": info.get("description", "Unknown"),
+        }
+
+    with _STATE_LOCK:
+        ACTIVE_INSTANCE = port
+        ACTIVE_EXPLICIT = True
+    log.info("select_instance: port=%s desc=%s", port, info.get("description"))
     return {
         "success": True,
         "port": port,
         "description": info.get("description", "Unknown"),
-        "idb_path": info.get("idb_path")
+        "idb_path": info.get("idb_path"),
     }
 
 
 @mcp.tool
 def ida_get_active_instance() -> dict:
     """Get information about the currently active IDA instance."""
-    global ACTIVE_INSTANCE
     instances = discover_instances()
 
     if not instances:
-        return {"error": "No IDA instances available. Open IDA and press Ctrl+Alt+M to start."}
+        return {"error": _no_target_error_message()}
 
-    # Find active instance
-    if ACTIVE_INSTANCE and ACTIVE_INSTANCE in instances:
-        port = ACTIVE_INSTANCE
+    with _STATE_LOCK:
+        active = ACTIVE_INSTANCE
+        explicit = ACTIVE_EXPLICIT
+
+    if active and active in instances:
+        port = active
+    elif explicit:
+        # Explicitly selected instance is gone/offline -- report, do not rebind.
+        return {"error": _no_target_error_message()}
     else:
         # Auto-select first online instance
         port = None
@@ -234,7 +419,7 @@ def ida_get_active_instance() -> dict:
                 port = p
                 break
         if port is None:
-            return {"error": "No online IDA instances available"}
+            return {"error": _no_target_error_message()}
 
     info = instances[port]
     return {
@@ -243,7 +428,8 @@ def ida_get_active_instance() -> dict:
         "description": info.get("description", "Unknown"),
         "idb_path": info.get("idb_path"),
         "input_file": info.get("input_file"),
-        "online": info.get("online", False)
+        "online": info.get("online", False),
+        "explicit": explicit and port == active,
     }
 
 
@@ -254,54 +440,79 @@ dispatch_original = mcp.registry.dispatch
 
 
 def proxy_to_ida(request: dict | str | bytes, host: str, port: int, inject_instance_info: bool = False) -> JsonRpcResponse | None:
-    """Proxy a request to IDA instance.
+    """Proxy a request to an IDA instance.
 
-    If inject_instance_info is True, adds instance metadata to the response
+    Uses PROXY_TIMEOUT (default 180s, env-overridable) so heavy decompiles /
+    full analysis are not dropped as the old 30s would. Retries ONLY on
+    ConnectionRefusedError -- that is raised at connect time, before any bytes
+    are sent, so a write tool (rename/set_type/patch) can never be re-applied.
+
+    If inject_instance_info is True, instance metadata is added to the response
     so the model knows which binary it queried.
     """
-    conn = http.client.HTTPConnection(host, port, timeout=30)
-    try:
-        if isinstance(request, dict):
-            request = json.dumps(request)
-        elif isinstance(request, str):
-            request = request.encode("utf-8")
-        # Enable extensions via query param (debugger tools enabled)
-        conn.request("POST", "/mcp?ext=dbg", request, {"Content-Type": "application/json"})
-        response = conn.getresponse()
-        data = response.read().decode()
-        result = json.loads(data)
+    if isinstance(request, dict):
+        body = json.dumps(request).encode("utf-8")
+    elif isinstance(request, str):
+        body = request.encode("utf-8")
+    else:
+        body = bytes(request)
 
-        # Inject instance info into structuredContent (where Claude reads from)
-        if inject_instance_info and "result" in result:
-            mcp_result = result["result"]
-            structured = mcp_result.get("structuredContent") if isinstance(mcp_result, dict) else None
+    last_exc: Exception | None = None
+    for attempt in range(PROXY_CONNECT_RETRIES + 1):
+        conn = http.client.HTTPConnection(host, port, timeout=PROXY_TIMEOUT)
+        try:
+            # Enable extensions via query param (debugger tools enabled)
+            conn.request("POST", "/mcp?ext=dbg", body, {"Content-Type": "application/json"})
+            response = conn.getresponse()
+            data = response.read().decode()
+            result = json.loads(data)
 
-            if structured is not None:
-                instances = discover_instances()
-                instance_info = instances.get(port)
+            # Inject instance info into structuredContent (where Claude reads from)
+            if inject_instance_info and "result" in result:
+                mcp_result = result["result"]
+                structured = mcp_result.get("structuredContent") if isinstance(mcp_result, dict) else None
 
-                if instance_info:
-                    instance_meta = {
-                        "port": port,
-                        "description": instance_info.get("description"),
-                        "idb_path": instance_info.get("idb_path"),
-                    }
-                else:
-                    instance_meta = {
-                        "port": port,
-                        "error": "instance not found in registry",
-                        "available_ports": list(instances.keys()),
-                    }
+                if structured is not None:
+                    instances = _read_registry()
+                    instance_info = instances.get(port)
 
-                # Inject into structuredContent
-                if isinstance(structured, dict):
-                    structured["_instance"] = instance_meta
-                elif isinstance(structured, list):
-                    mcp_result["structuredContent"] = {"_instance": instance_meta, "data": structured}
+                    if instance_info:
+                        instance_meta = {
+                            "port": port,
+                            "description": instance_info.get("description"),
+                            "idb_path": instance_info.get("idb_path"),
+                        }
+                    else:
+                        instance_meta = {
+                            "port": port,
+                            "error": "instance not found in registry",
+                            "available_ports": sorted(instances.keys()),
+                        }
 
-        return result
-    finally:
-        conn.close()
+                    # Inject into structuredContent
+                    if isinstance(structured, dict):
+                        structured["_instance"] = instance_meta
+                    elif isinstance(structured, list):
+                        mcp_result["structuredContent"] = {"_instance": instance_meta, "data": structured}
+
+            return result
+        except ConnectionRefusedError as e:
+            # Pre-send failure (plugin briefly down / restarting). Safe to retry.
+            last_exc = e
+            if attempt < PROXY_CONNECT_RETRIES:
+                log.warning(
+                    "proxy: connection refused %s:%s (attempt %d/%d), retrying",
+                    host, port, attempt + 1, PROXY_CONNECT_RETRIES,
+                )
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            raise
+        finally:
+            conn.close()
+
+    if last_exc is not None:  # pragma: no cover - loop always returns or raises
+        raise last_exc
+    return None
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -332,6 +543,14 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
             try:
                 ida_response = proxy_to_ida(request, target[0], target[1])
                 ida_tools = ida_response.get("result", {}).get("tools", []) if ida_response else []
+                # Advertise the optional per-call `instance` routing field on every
+                # proxied tool so agents can target an instance inline.
+                for t in ida_tools:
+                    schema = t.get("inputSchema")
+                    if isinstance(schema, dict):
+                        props = schema.setdefault("properties", {})
+                        if isinstance(props, dict):
+                            props.setdefault("instance", INSTANCE_SCHEMA_PROP)
                 # Merge: local tools first, then IDA tools
                 all_tools = local_tools + ida_tools
                 return {"jsonrpc": "2.0", "result": {"tools": all_tools}, "id": request_id}
@@ -345,26 +564,42 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         params = request_obj.get("params", {})
         tool_name = params.get("name", "")
 
-        if tool_name in LOCAL_TOOLS:
-            return dispatch_original(request)
+        # Strip the proxy-only `instance` routing field before the request ever
+        # reaches a tool (local or IDA) -- the underlying tools don't accept it.
+        args = params.get("arguments")
+        inst_spec = args.pop("instance", None) if isinstance(args, dict) else None
 
-        # Proxy to IDA
-        target = get_target_instance()
-        if target is None:
-            if request_id is None:
-                return None
-            shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
-            return JsonRpcResponse({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": f"No IDA instances available. Open IDA and press {shortcut} to start the MCP server.",
-                },
-                "id": request_id,
-            })
+        if tool_name in LOCAL_TOOLS:
+            return dispatch_original(request_obj)
+
+        # Per-call routing: an inline `instance` overrides the selected/auto target
+        # for THIS request only (no ACTIVE_INSTANCE mutation -> multi-agent safe).
+        if inst_spec not in (None, ""):
+            target, err = resolve_instance(inst_spec)
+            if target is None:
+                if request_id is None:
+                    return None
+                return JsonRpcResponse({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32000, "message": err},
+                    "id": request_id,
+                })
+        else:
+            target = get_target_instance()
+            if target is None:
+                if request_id is None:
+                    return None
+                return JsonRpcResponse({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32000,
+                        "message": _no_target_error_message(),
+                    },
+                    "id": request_id,
+                })
 
         try:
-            return proxy_to_ida(request, target[0], target[1], inject_instance_info=True)
+            return proxy_to_ida(request_obj, target[0], target[1], inject_instance_info=True)
         except Exception as e:
             if request_id is None:
                 return None
@@ -384,12 +619,11 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     if target is None:
         if request_id is None:
             return None
-        shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
         return JsonRpcResponse({
             "jsonrpc": "2.0",
             "error": {
                 "code": -32000,
-                "message": f"No IDA instances available. Open IDA and press {shortcut} to start the MCP server.",
+                "message": _no_target_error_message(),
             },
             "id": request_id,
         })

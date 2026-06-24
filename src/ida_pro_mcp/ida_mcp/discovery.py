@@ -1,8 +1,14 @@
 """Instance discovery for IDA Pro MCP.
 
 IDA plugin instances register themselves by writing JSON files to
-{ida_user_dir}/mcp/instances/. The MCP server discovers running
-instances by reading these files and validating PID liveness.
+~/.ida-mcp/instances/<port>.json. The MCP server (server.py) and the
+plugin's own discovery tools both read this single canonical location,
+validating PID liveness and (optionally) TCP reachability.
+
+This path/schema MUST stay in lock-step with server.py's reader. Each
+file carries both ``description`` (a human label that disambiguates IDBs
+sharing a root filename, e.g. "r5apex.exe s3" vs "r5apex.exe s16") and
+``binary`` (the raw root filename) so older and newer consumers agree.
 """
 
 import datetime
@@ -12,7 +18,7 @@ import os
 import socket
 import sys
 import tempfile
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class InstanceInfo(TypedDict):
@@ -22,32 +28,36 @@ class InstanceInfo(TypedDict):
     binary: str
     idb_path: str
     started_at: str
-
-
-def _get_ida_user_dir() -> str:
-    if sys.platform == "win32":
-        return os.path.join(os.environ["APPDATA"], "Hex-Rays", "IDA Pro")
-    return os.path.join(os.path.expanduser("~"), ".idapro")
+    description: NotRequired[str]
+    input_file: NotRequired[str]
 
 
 def get_instances_dir() -> str:
-    return os.path.join(_get_ida_user_dir(), "mcp", "instances")
+    return os.path.join(os.path.expanduser("~"), ".ida-mcp", "instances")
 
 
 def _instance_file_path(port: int) -> str:
-    return os.path.join(get_instances_dir(), f"instance_{port}.json")
+    return os.path.join(get_instances_dir(), f"{port}.json")
 
 
 def register_instance(
-    host: str, port: int, pid: int, binary: str, idb_path: str
+    host: str,
+    port: int,
+    pid: int,
+    binary: str,
+    idb_path: str,
+    description: str | None = None,
+    input_file: str | None = None,
 ) -> str:
     """Write an instance registration file. Returns the file path."""
     info: InstanceInfo = {
         "host": host,
         "port": port,
         "pid": pid,
+        "description": description or binary or os.path.basename(idb_path) or f"instance:{port}",
         "binary": binary,
         "idb_path": idb_path,
+        "input_file": input_file or "",
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     instances_dir = get_instances_dir()
@@ -119,8 +129,12 @@ def discover_instances() -> list[InstanceInfo]:
         return []
 
     result: list[InstanceInfo] = []
-    pattern = os.path.join(instances_dir, "instance_*.json")
+    pattern = os.path.join(instances_dir, "*.json")
     for file_path in glob.glob(pattern):
+        # Skip in-flight atomic-write temp files (mkstemp prefix ".tmp_").
+        # glob already excludes dotfiles, but guard explicitly for safety.
+        if os.path.basename(file_path).startswith("."):
+            continue
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 info: InstanceInfo = json.load(f)

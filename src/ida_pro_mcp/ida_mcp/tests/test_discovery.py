@@ -69,7 +69,7 @@ def test_register_overwrites_existing():
     with _tmp_instances_dir() as tmp:
         discovery.register_instance("127.0.0.1", 55005, os.getpid(), "first.bin", "first.idb")
         discovery.register_instance("127.0.0.1", 55005, os.getpid(), "second.bin", "second.idb")
-        with open(os.path.join(tmp, "instance_55005.json"), "r") as f:
+        with open(os.path.join(tmp, "55005.json"), "r") as f:
             data = json.load(f)
         assert data["binary"] == "second.bin"
 
@@ -113,14 +113,14 @@ def test_discover_cleans_up_dead_pid():
     with _tmp_instances_dir() as tmp:
         discovery.register_instance("127.0.0.1", 55002, 4_000_000, "dead.bin", "dead.idb")
         assert discovery.discover_instances() == []
-        assert not os.path.isfile(os.path.join(tmp, "instance_55002.json"))
+        assert not os.path.isfile(os.path.join(tmp, "55002.json"))
 
 
 @test()
 def test_discover_cleans_up_corrupt_json():
     """discover_instances removes files with invalid JSON."""
     with _tmp_instances_dir() as tmp:
-        corrupt_path = os.path.join(tmp, "instance_55003.json")
+        corrupt_path = os.path.join(tmp, "55003.json")
         with open(corrupt_path, "w") as f:
             f.write("not json{{{")
         assert discovery.discover_instances() == []
@@ -131,7 +131,7 @@ def test_discover_cleans_up_corrupt_json():
 def test_discover_cleans_up_missing_required_keys():
     """discover_instances removes registrations missing host/port/pid."""
     with _tmp_instances_dir() as tmp:
-        path = os.path.join(tmp, "instance_55004.json")
+        path = os.path.join(tmp, "55004.json")
         with open(path, "w") as f:
             json.dump({"host": "127.0.0.1"}, f)
         assert discovery.discover_instances() == []
@@ -173,7 +173,7 @@ def test_discover_sorts_by_started_at():
                 "pid": os.getpid(), "binary": f"bin_{port}",
                 "idb_path": f"/tmp/{port}.idb", "started_at": ts,
             }
-            path = os.path.join(tmp, f"instance_{port}.json")
+            path = os.path.join(tmp, f"{port}.json")
             with open(path, "w") as f:
                 json.dump(info, f)
 
