@@ -235,10 +235,15 @@ class MCP(idaapi.plugin_t):
             self._registered_port = None
 
     def run(self, arg):
+        # Toggle: if the server is already running, stop it and stay stopped
+        # (press the hotkey again to start). A fresh start always reloads the
+        # package below, so stop->start still doubles as a hot reload.
         if self.mcp:
             self._unregister_instance()
             self.mcp.stop()
             self.mcp = None
+            print("[MCP] Server stopped")
+            return
 
         # HACK: ensure fresh load of ida_mcp package
         unload_package("ida_mcp")
