@@ -588,23 +588,34 @@ def func_query(
     """Query functions with richer filtering than list_funcs."""
     queries = normalize_dict_list(queries)
 
+    # Build cheap (ea, name, size) records first. get_tinfo() per function is
+    # expensive and was previously run for EVERY function up front -> timed out
+    # on large binaries. Defer it (see has_type below) so it runs only for the
+    # has_type filter (on the already-filtered subset) and the returned page.
     all_functions: list[dict] = []
     for addr in idautils.Functions():
         fn = idaapi.get_func(addr)
         if not fn:
             continue
         size_int = fn.end_ea - fn.start_ea
-        fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
-        has_type = ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea)
         all_functions.append(
             {
+                "ea": fn.start_ea,
                 "addr": hex(fn.start_ea),
-                "name": fn_name,
+                "name": ida_funcs.get_func_name(fn.start_ea) or "<unnamed>",
                 "size": hex(size_int),
                 "size_int": size_int,
-                "has_type": has_type,
             }
         )
+
+    _type_cache: dict[int, bool] = {}
+
+    def has_type(ea: int) -> bool:
+        cached = _type_cache.get(ea)
+        if cached is None:
+            cached = bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), ea))
+            _type_cache[ea] = cached
+        return cached
 
     def apply_name_regex(items: list[dict], expr: str) -> list[dict]:
         if not expr:
@@ -643,7 +654,7 @@ def func_query(
 
         if "has_type" in query:
             require_type = bool(query.get("has_type"))
-            filtered = [f for f in filtered if bool(f["has_type"]) is require_type]
+            filtered = [f for f in filtered if has_type(f["ea"]) is require_type]
 
         if sort_by == "name":
             filtered.sort(key=lambda f: f["name"].lower(), reverse=descending)
@@ -653,7 +664,10 @@ def func_query(
             filtered.sort(key=lambda f: int(f["addr"], 16), reverse=descending)
 
         page = paginate(filtered, offset, count)
-        page["data"] = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+        page["data"] = [
+            {"addr": it["addr"], "name": it["name"], "size": it["size"], "has_type": has_type(it["ea"])}
+            for it in page["data"]
+        ]
         results.append(page)
 
     return results
@@ -857,18 +871,56 @@ def idb_save(
         return {"ok": False, "path": path or None, "error": str(e)}
 
 
+def _search_names_substring(needle: str, limit: int, offset: int):
+    """Fast name-index substring search over functions + globals.
+
+    Uses IDA's name list (no strings cache build), so symbol lookups stay
+    instant on large binaries. Returns (matches, more)."""
+    needle_l = needle.lower()
+    matches: list[dict] = []
+    skipped = 0
+    more = False
+    for ea, name in idautils.Names():
+        if not name or needle_l not in name.lower():
+            continue
+        if skipped < offset:
+            skipped += 1
+            continue
+        if len(matches) >= limit:
+            more = True
+            break
+        matches.append({"addr": hex(ea), "string": name, "kind": "symbol"})
+    return matches, more
+
+
 @tool
 @idasync
 def find_regex(
-    pattern: Annotated[str, "Regex pattern to search for in strings"],
+    pattern: Annotated[str, "Regex over strings; a plain identifier also matches symbol names"],
     limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> FindRegexResult:
-    """Search strings by case-insensitive regex with offset/limit pagination."""
+    """Search strings by case-insensitive regex with offset/limit pagination.
+
+    Fast path: when `pattern` is a plain identifier (e.g. "ReinitPredictables"),
+    the name index (functions + globals) is searched FIRST -- instant, and never
+    builds the strings cache. Falls through to the string search if no symbol
+    matches, and any pattern with regex metacharacters goes straight to strings.
+    """
     if limit <= 0:
         limit = 30
     if limit > 500:
         limit = 500
+
+    # Plain identifier -> try the name index first (what symbol lookups want).
+    if re.fullmatch(r"[A-Za-z0-9_]+", pattern):
+        name_matches, more = _search_names_substring(pattern, limit, offset)
+        if name_matches:
+            return {
+                "n": len(name_matches),
+                "matches": name_matches,
+                "cursor": {"next": offset + limit} if more else {"done": True},
+            }
 
     matches = []
     regex = re.compile(pattern, re.IGNORECASE)
