@@ -4,6 +4,8 @@ This file serves as the entry point for IDA Pro's plugin system.
 It loads the actual implementation from the ida_mcp package.
 """
 
+import logging
+import os
 import sys
 import idaapi
 import ida_kernwin
@@ -225,6 +227,29 @@ class MCP(idaapi.plugin_t):
 
         return idaapi.PLUGIN_KEEP
 
+    def _setup_log_file(self, port: int):
+        """Attach a per-instance log file so tool calls, errors, and cancellations
+        are captured to disk. Log lives at ~/.ida-mcp/logs/{port}.log."""
+        log_dir = os.path.join(os.path.expanduser("~"), ".ida-mcp", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"{port}.log")
+        handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        root = logging.getLogger()
+        root.addHandler(handler)
+        if root.level > logging.DEBUG:
+            root.setLevel(logging.DEBUG)
+        self._log_handler = handler
+        self._log_path = log_path
+        print(f"[MCP] Logging to {log_path}")
+
+    def _teardown_log_file(self):
+        handler = getattr(self, "_log_handler", None)
+        if handler is not None:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
+            self._log_handler = None
+
     def _unregister_instance(self):
         port = getattr(self, "_registered_port", None)
         if port is not None:
@@ -244,6 +269,7 @@ class MCP(idaapi.plugin_t):
         # package below, so stop->start still doubles as a hot reload.
         if self.mcp:
             self._unregister_instance()
+            self._teardown_log_file()
             self.mcp.stop()
             self.mcp = None
             print("[MCP] Server stopped")
@@ -267,6 +293,7 @@ class MCP(idaapi.plugin_t):
                 self.mcp = MCP_SERVER
                 set_local_instance(self.host, port)
                 self._register_instance(port)
+                self._setup_log_file(port)
                 # Warm the strings cache AFTER the server is bound and listening on
                 # its own thread, so find_regex is hot from the first call without
                 # delaying startup or the proxy's first connect. Upstream c25459b

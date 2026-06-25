@@ -1,5 +1,3 @@
-from itertools import islice
-import struct
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 import ida_lines
 import ida_funcs
@@ -10,6 +8,7 @@ import ida_nalt
 import ida_bytes
 import ida_ida
 import ida_idaapi
+import ida_kernwin
 import ida_xref
 import ida_ua
 import ida_name
@@ -58,6 +57,7 @@ class DecompileResult(TypedDict):
 class ResultCursor(TypedDict, total=False):
     next: int
     done: bool
+    cancelled: bool
 
 
 class DisasmResult(TypedDict, total=False):
@@ -219,14 +219,6 @@ class BasicBlocksResult(TypedDict, total=False):
     cursor: ResultCursor
 
 
-class FindResult(TypedDict, total=False):
-    query: str | int | None
-    matches: list[str]
-    count: int
-    cursor: ResultCursor
-    error: str | None
-
-
 class InsnScanRange(TypedDict):
     start: str
     end: str
@@ -328,20 +320,6 @@ class CallGraphResult(TypedDict, total=False):
 # Instruction Helpers
 # ============================================================================
 
-_IMM_SCAN_BACK_MAX = 15
-
-
-def _raw_bin_search(
-    ea: int, max_ea: int, data: bytes, mask: bytes, flags: int = 0
-) -> int:
-    """Search for raw bytes with mask, compatible across IDA versions.
-
-    Returns the match address, or idaapi.BADADDR if not found.
-    """
-    search_flags = flags or (ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW)
-    return compat.raw_bin_search(ea, max_ea, data, mask, search_flags)
-
-
 def _decode_insn_at(ea: int) -> ida_ua.insn_t | None:
     insn = ida_ua.insn_t()
     if ida_ua.decode_insn(insn, ea) == 0:
@@ -371,80 +349,6 @@ def _insn_mnem(insn: ida_ua.insn_t) -> str:
         return insn.get_canon_mnem().lower()
     except Exception:
         return ""
-
-
-def _value_to_le_bytes(value: int) -> tuple[bytes, int, int] | None:
-    if value < 0:
-        if value >= -0x80000000:
-            size = 4
-            value &= 0xFFFFFFFF
-        elif value >= -0x8000000000000000:
-            size = 8
-            value &= 0xFFFFFFFFFFFFFFFF
-        else:
-            return None
-    else:
-        if value <= 0xFFFFFFFF:
-            size = 4
-        elif value <= 0xFFFFFFFFFFFFFFFF:
-            size = 8
-        else:
-            return None
-
-    fmt = "<I" if size == 4 else "<Q"
-    return struct.pack(fmt, value), size, value
-
-
-def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
-    candidates: list[tuple[int, int, bytes]] = []
-
-    def add(size: int, signed_val: int):
-        if size == 4:
-            masked = signed_val & 0xFFFFFFFF
-            if not (-0x80000000 <= signed_val <= 0x7FFFFFFF):
-                return
-            b = struct.pack("<I", masked)
-        else:
-            masked = signed_val & 0xFFFFFFFFFFFFFFFF
-            if not (-0x8000000000000000 <= signed_val <= 0x7FFFFFFFFFFFFFFF):
-                return
-            b = struct.pack("<Q", masked)
-        candidates.append((masked, size, b))
-
-    add(4, value)
-    add(8, value)
-    return candidates
-
-
-def _resolve_immediate_insn_start(
-    match_ea: int,
-    value: int,
-    seg_start: int,
-    alt_value: int | None = None,
-) -> int | None:
-    start_min = max(seg_start, match_ea - _IMM_SCAN_BACK_MAX)
-    for start in range(match_ea, start_min - 1, -1):
-        insn = _decode_insn_at(start)
-        if insn is None:
-            continue
-        end_ea = start + insn.size
-        if not (start <= match_ea < end_ea):
-            continue
-        for i in range(8):
-            op_type = _operand_type(insn, i)
-            if op_type == ida_ua.o_void:
-                break
-            if op_type != ida_ua.o_imm:
-                continue
-            op_val = _operand_value(insn, i)
-            if op_val is None:
-                continue
-            if op_val == value or (alt_value is not None and op_val == alt_value):
-                offb = getattr(insn.ops[i], "offb", 0)
-                if offb and start + offb != match_ea:
-                    continue
-                return start
-    return None
 
 
 def _clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
@@ -1608,9 +1512,7 @@ def find_bytes(
                 else:
                     matches.append(hex(ea))
                     if len(matches) >= limit:
-                        # Check if there's more
-                        next_ea = searcher(ea + 1, max_ea)
-                        more = next_ea != idaapi.BADADDR
+                        more = True
                         break
                 ea += 1
         except Exception as e:
@@ -1625,12 +1527,18 @@ def find_bytes(
             )
             continue
 
+        if ida_kernwin.user_cancelled():
+            cursor: ResultCursor = {"next": offset + len(matches), "cancelled": True}
+        elif more:
+            cursor = {"next": offset + limit}
+        else:
+            cursor = {"done": True}
         results.append(
             {
                 "pattern": pattern,
                 "matches": matches,
                 "n": len(matches),
-                "cursor": {"next": offset + limit} if more else {"done": True},
+                "cursor": cursor,
             }
         )
     return results
@@ -1713,238 +1621,6 @@ def basic_blocks(
                     "cursor": {"done": True},
                 }
             )
-    return results
-
-
-# ============================================================================
-# Search Operations
-# ============================================================================
-
-
-@tool
-@idasync
-def find(
-    type: Annotated[
-        str, "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'"
-    ],
-    targets: Annotated[
-        list[str | int] | str | int, "Search targets (strings, integers, or addresses)"
-    ],
-    limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
-    offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
-) -> list[FindResult]:
-    """Search strings/immediates/refs for targets with offset/limit pagination."""
-    if not isinstance(targets, list):
-        targets = [targets]
-
-    # Enforce max limit to prevent token overflow
-    if limit <= 0 or limit > 10000:
-        limit = 10000
-
-    results = []
-
-    if type == "string":
-        # Raw byte search for UTF-8 substrings across the binary
-        for pattern in targets:
-            pattern_str = str(pattern)
-            pattern_bytes = pattern_str.encode("utf-8")
-            if not pattern_bytes:
-                results.append(
-                    {
-                        "query": pattern_str,
-                        "matches": [],
-                        "count": 0,
-                        "cursor": {"done": True},
-                        "error": "Empty pattern",
-                    }
-                )
-                continue
-
-            matches = []
-            skipped = 0
-            more = False
-            try:
-                ea = ida_ida.inf_get_min_ea()
-                max_ea = ida_ida.inf_get_max_ea()
-                mask = b"\xff" * len(pattern_bytes)
-                while ea != idaapi.BADADDR:
-                    ea = _raw_bin_search(ea, max_ea, pattern_bytes, mask)
-                    if ea != idaapi.BADADDR:
-                        if skipped < offset:
-                            skipped += 1
-                        else:
-                            matches.append(hex(ea))
-                            if len(matches) >= limit:
-                                next_ea = _raw_bin_search(
-                                    ea + 1, max_ea, pattern_bytes, mask
-                                )
-                                more = next_ea != idaapi.BADADDR
-                                break
-                        ea += 1
-            except Exception:
-                pass
-
-            results.append(
-                {
-                    "query": pattern_str,
-                    "matches": matches,
-                    "count": len(matches),
-                    "cursor": {"next": offset + limit} if more else {"done": True},
-                    "error": None,
-                }
-            )
-
-    elif type == "immediate":
-        # Search for immediate values
-        for value in targets:
-            if isinstance(value, str):
-                try:
-                    value = int(value, 0)
-                except ValueError:
-                    value = 0
-
-            matches = []
-            skipped = 0
-            more = False
-            try:
-                candidates = _value_candidates_for_immediate(value)
-                if not candidates:
-                    results.append(
-                        {
-                            "query": value,
-                            "matches": [],
-                            "count": 0,
-                            "cursor": {"done": True},
-                            "error": "Immediate out of range",
-                        }
-                    )
-                    continue
-
-                seen_insn = set()
-                for seg_ea in idautils.Segments():
-                    seg = idaapi.getseg(seg_ea)
-                    if not seg or not (seg.perm & idaapi.SEGPERM_EXEC):
-                        continue
-                    for normalized, size, pattern_bytes in candidates:
-                        ea = seg.start_ea
-                        while ea != idaapi.BADADDR and ea < seg.end_ea:
-                            ea = _raw_bin_search(
-                                ea, seg.end_ea, pattern_bytes, b"\xff" * size
-                            )
-                            if ea == idaapi.BADADDR:
-                                break
-
-                            insn_start = _resolve_immediate_insn_start(
-                                ea, value, seg.start_ea, normalized
-                            )
-                            if insn_start is not None and insn_start not in seen_insn:
-                                seen_insn.add(insn_start)
-                                if skipped < offset:
-                                    skipped += 1
-                                else:
-                                    matches.append(hex(insn_start))
-                                    if len(matches) >= limit:
-                                        more = True
-                                        break
-
-                            ea += 1
-
-                        if more:
-                            break
-                    if more:
-                        break
-            except Exception:
-                pass
-
-            results.append(
-                {
-                    "query": value,
-                    "matches": matches,
-                    "count": len(matches),
-                    "cursor": {"next": offset + limit} if more else {"done": True},
-                    "error": None,
-                }
-            )
-
-    elif type == "data_ref":
-        # Find all data references to targets
-        for target_str in targets:
-            try:
-                target = parse_address(str(target_str))
-                gen = (hex(xref) for xref in idautils.DataRefsTo(target))
-                # Skip offset items, take limit+1 to check more
-                matches = list(islice(islice(gen, offset, None), limit + 1))
-                more = len(matches) > limit
-                if more:
-                    matches = matches[:limit]
-
-                results.append(
-                    {
-                        "query": str(target_str),
-                        "matches": matches,
-                        "count": len(matches),
-                        "cursor": (
-                            {"next": offset + limit} if more else {"done": True}
-                        ),
-                        "error": None,
-                    }
-                )
-            except Exception as e:
-                results.append(
-                    {
-                        "query": str(target_str),
-                        "matches": [],
-                        "count": 0,
-                        "cursor": {"done": True},
-                        "error": str(e),
-                    }
-                )
-
-    elif type == "code_ref":
-        # Find all code references to targets
-        for target_str in targets:
-            try:
-                target = parse_address(str(target_str))
-                gen = (hex(xref) for xref in idautils.CodeRefsTo(target, 0))
-                # Skip offset items, take limit+1 to check more
-                matches = list(islice(islice(gen, offset, None), limit + 1))
-                more = len(matches) > limit
-                if more:
-                    matches = matches[:limit]
-
-                results.append(
-                    {
-                        "query": str(target_str),
-                        "matches": matches,
-                        "count": len(matches),
-                        "cursor": (
-                            {"next": offset + limit} if more else {"done": True}
-                        ),
-                        "error": None,
-                    }
-                )
-            except Exception as e:
-                results.append(
-                    {
-                        "query": str(target_str),
-                        "matches": [],
-                        "count": 0,
-                        "cursor": {"done": True},
-                        "error": str(e),
-                    }
-                )
-
-    else:
-        results.append(
-            {
-                "query": None,
-                "matches": [],
-                "count": 0,
-                "cursor": {"done": True},
-                "error": f"Unknown search type: {type}",
-            }
-        )
-
     return results
 
 
