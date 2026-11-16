@@ -78,11 +78,11 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
 
 
 DEFAULT_CORS_POLICY = "local"
+_CORS_POLICY_CACHE = DEFAULT_CORS_POLICY
 
 
-def get_cors_policy(port: int) -> str:
-    """Retrieve the current CORS policy from configuration."""
-    match config_json_get("cors_policy", DEFAULT_CORS_POLICY):
+def _apply_cached_cors_policy(policy: str, port: int) -> str:
+    match policy:
         case "unrestricted":
             return "*"
         case "local":
@@ -93,7 +93,25 @@ def get_cors_policy(port: int) -> str:
             return "*"
 
 
+def get_cors_policy(port: int) -> str:
+    """Retrieve the current CORS policy from the in-memory cache.
+
+    Must not touch IDA (execute_sync) -- this is called from HTTP handler
+    threads, including ping, while a long tool may own the main thread.
+    """
+    return _apply_cached_cors_policy(_CORS_POLICY_CACHE, port)
+
+
+def set_cors_policy_cache(policy: str) -> None:
+    global _CORS_POLICY_CACHE
+    _CORS_POLICY_CACHE = policy or DEFAULT_CORS_POLICY
+
+
 ORIGINAL_TOOLS = handle_enabled_tools(MCP_SERVER.tools, "enabled_tools")
+try:
+    set_cors_policy_cache(config_json_get("cors_policy", DEFAULT_CORS_POLICY))
+except Exception:
+    set_cors_policy_cache(DEFAULT_CORS_POLICY)
 
 
 class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
@@ -102,13 +120,15 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         self.update_cors_policy()
 
     def update_cors_policy(self):
-        match config_json_get("cors_policy", DEFAULT_CORS_POLICY):
+        match _CORS_POLICY_CACHE:
             case "unrestricted":
                 self.mcp_server.cors_allowed_origins = "*"
             case "local":
                 self.mcp_server.cors_allowed_origins = self.mcp_server.cors_localhost
             case "direct":
                 self.mcp_server.cors_allowed_origins = None
+            case _:
+                self.mcp_server.cors_allowed_origins = "*"
 
     def do_POST(self):
         """Handles POST requests."""
@@ -125,6 +145,38 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
             finally:
                 set_request_proxied(False)
 
+    def _handle_mcp_post(self, body: bytes):
+        ticket = None
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and parsed.get("method") == "tools/call":
+                params = parsed.get("params") or {}
+                name = params.get("name") if isinstance(params, dict) else None
+                if name:
+                    from .queue_status import enter
+
+                    ticket = enter(str(name))
+        except Exception:
+            ticket = None
+        try:
+            super()._handle_mcp_post(body)
+        finally:
+            if ticket is not None:
+                from .queue_status import leave
+
+                leave(ticket)
+
+    def _handle_status_get(self):
+        from .queue_status import snapshot
+
+        body = json.dumps(snapshot()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         """Handles GET requests."""
         from .api_discovery import PROXY_HEADER, set_request_proxied
@@ -133,6 +185,12 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         try:
             parsed = urlparse(self.path)
             path = parsed.path
+
+            if path == "/status":
+                if not self._check_api_request():
+                    return
+                self._handle_status_get()
+                return
 
             if path == "/config.html":
                 if not self._check_host():
@@ -468,6 +526,7 @@ input[type="submit"]:hover {
         # Update CORS policy
         cors_policy = postvars.get("cors_policy", [DEFAULT_CORS_POLICY])[0]
         config_json_set("cors_policy", cors_policy)
+        set_cors_policy_cache(cors_policy)
         self.update_cors_policy()
 
         # Update the server's tools (discovery tools cannot be disabled)

@@ -1,3 +1,4 @@
+import os
 import re
 import select
 import socket
@@ -1120,6 +1121,9 @@ class McpServer:
                 # accept the schema while anyOf still constrains the variants.
                 return_schema = {"type": "object", **return_schema}
 
-            schema["outputSchema"] = return_schema
+            # Off by default: strict clients (opencode) validate structuredContent
+            # against it and reject payloads carrying extra runtime keys.
+            if os.environ.get("IDA_MCP_OUTPUT_SCHEMA") == "1":
+                schema["outputSchema"] = return_schema
 
         return schema

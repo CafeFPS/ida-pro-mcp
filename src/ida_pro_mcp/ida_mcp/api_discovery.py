@@ -17,7 +17,7 @@ from typing import Annotated, NotRequired, TypedDict
 
 from .rpc import tool, MCP_SERVER
 from .zeromcp import EXTERNAL_BASE_HEADER, get_current_request_external_base_url
-from .discovery import discover_instances, probe_instance
+from .discovery import discover_instances, probe_instance, read_instance_status
 
 
 class InstanceSelectionResult(TypedDict, total=False):
@@ -348,16 +348,25 @@ def list_instances() -> list[InstanceListItem]:
     result = []
     redirect = get_redirect_target()
     for inst in instances:
-        reachable = probe_instance(inst["host"], inst["port"])
+        status = read_instance_status(inst["port"])
+        busy = bool(status and status.get("busy"))
+        reachable = True if busy else probe_instance(inst["host"], inst["port"])
         if redirect:
             active = inst["host"] == redirect[0] and inst["port"] == redirect[1]
         else:
             active = inst["host"] == _LOCAL_HOST and inst["port"] == _LOCAL_PORT
-        result.append({
+        item = {
             **inst,
             "reachable": reachable,
             "active": active,
-        })
+            "busy": busy,
+        }
+        if status:
+            current = status.get("current") or {}
+            item["queue_depth"] = status.get("queue_depth") or 0
+            item["current_tool"] = current.get("tool")
+            item["queue"] = status.get("queue") or []
+        result.append(item)
     return result
 
 
@@ -385,7 +394,9 @@ def select_instance(
         _clear_redirect_target()
         return {"success": True, "host": host, "port": port, "message": "Selected local instance"}
 
-    if not probe_instance(host, port):
+    status = read_instance_status(port)
+    busy = bool(status and status.get("busy"))
+    if not busy and not probe_instance(host, port):
         return {"success": False, "error": f"Instance at {host}:{port} is not reachable"}
 
     _set_redirect_target(host, port)

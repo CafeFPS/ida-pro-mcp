@@ -255,9 +255,12 @@ class MCP(idaapi.plugin_t):
         if port is not None:
             try:
                 if TYPE_CHECKING:
+                    from .ida_mcp.queue_status import unbind
                     from .ida_mcp.discovery import unregister_instance
                 else:
+                    from ida_mcp.queue_status import unbind
                     from ida_mcp.discovery import unregister_instance
+                unbind()
                 unregister_instance(port)
             except Exception as e:
                 print(f"[MCP] Instance unregistration failed: {e}")
@@ -335,6 +338,11 @@ class MCP(idaapi.plugin_t):
                 input_file=input_file,
             )
             self._registered_port = port
+            try:
+                from ida_mcp.queue_status import bind_port
+                bind_port(port)
+            except Exception:
+                pass
             print(f"[MCP] Registered instance: {description} (pid={os.getpid()}, port={port})")
             print(f"  Discovery file: {file_path}")
         except Exception as e:

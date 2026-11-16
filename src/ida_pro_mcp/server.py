@@ -4,6 +4,7 @@ import json
 import shutil
 import argparse
 import http.client
+import socket
 import tempfile
 import threading
 import time
@@ -11,7 +12,6 @@ import logging
 import traceback
 import tomllib
 import tomli_w
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Annotated, TypedDict, NotRequired
 from urllib.parse import urlparse
 import glob
@@ -24,7 +24,7 @@ else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
     from zeromcp import McpServer
     from zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
-    from discovery import is_pid_alive
+    from discovery import is_pid_alive, read_instance_status, clear_instance_status
 
     sys.path.pop(0)  # Clean up
 
@@ -54,6 +54,9 @@ PROXY_TIMEOUT = float(os.environ.get("IDA_MCP_PROXY_TIMEOUT", "180"))
 # Only connection-establishment failures are retried -- never a request that may
 # have already reached IDA, so write tools cannot be double-applied.
 PROXY_CONNECT_RETRIES = int(os.environ.get("IDA_MCP_PROXY_RETRIES", "2"))
+# How long to wait for TCP accept when the plugin is alive but too busy to
+# accept (GIL held). Agents used to see this as "IDA is down".
+PROXY_BUSY_CONNECT_WAIT = float(os.environ.get("IDA_MCP_BUSY_CONNECT_WAIT", "60"))
 
 
 class InstanceInfo(TypedDict):
@@ -67,6 +70,12 @@ class InstanceInfo(TypedDict):
     pid: int
     online: NotRequired[bool]
     active: NotRequired[bool]
+    status: NotRequired[str]
+    busy: NotRequired[bool]
+    queue_depth: NotRequired[int]
+    current_tool: NotRequired[str | None]
+    current_elapsed_sec: NotRequired[float | None]
+    queue: NotRequired[list]
 
 
 _ONLINE_CACHE: dict[int, tuple[float, bool]] = {}  # port -> (monotonic_ts, online)
@@ -137,6 +146,7 @@ def _read_registry() -> dict[int, InstanceInfo]:
                 os.unlink(filepath)
             except OSError:
                 pass
+            clear_instance_status(port)
             with _STATE_LOCK:
                 _ONLINE_CACHE.pop(port, None)
             log.info(
@@ -151,48 +161,60 @@ def _read_registry() -> dict[int, InstanceInfo]:
     return instances
 
 
+def _enrich_instance(info: InstanceInfo) -> InstanceInfo:
+    """Attach queue/busy fields from the plugin sidecar. Live PID is never offline.
+
+    A 1s HTTP ping while IDA holds the GIL used to mark the instance offline
+    and make agents give up. The sidecar is written before execute_sync, so
+    this stays accurate during a long decompile/search.
+    """
+    port = info["port"]
+    pid = info.get("pid")
+    alive = isinstance(pid, int) and is_pid_alive(pid)
+    status = read_instance_status(port)
+    if not alive:
+        info["online"] = False
+        info["status"] = "offline"
+        info["busy"] = False
+        return info
+
+    busy = bool(status and status.get("busy"))
+    info["online"] = True
+    info["status"] = "busy" if busy else "online"
+    info["busy"] = busy
+    if status:
+        current = status.get("current") or {}
+        info["queue_depth"] = int(status.get("queue_depth") or 0)
+        info["current_tool"] = current.get("tool")
+        info["current_elapsed_sec"] = current.get("elapsed_sec")
+        info["queue"] = status.get("queue") or []
+    else:
+        info["queue_depth"] = 0
+        info["current_tool"] = None
+        info["current_elapsed_sec"] = None
+        info["queue"] = []
+    return info
+
+
 def discover_instances() -> dict[int, InstanceInfo]:
-    """Registry read + online status. Pings are cached (3s TTL) and executed in
-    parallel on cache miss so the STDIO loop is never blocked for N seconds."""
+    """Registry read + sidecar queue status. Never HTTP-pings IDA.
+
+    HTTP ping was a false-offline signal: a long tool holds the GIL, ping
+    times out in 1s, and the agent is told IDA is down.
+    """
     instances = _read_registry()
-    if not instances:
-        return instances
-
-    now = time.monotonic()
-    needs_ping: list[tuple[int, InstanceInfo]] = []
-    with _STATE_LOCK:
-        for port, info in instances.items():
-            cached = _ONLINE_CACHE.get(port)
-            if cached and (now - cached[0]) < _ONLINE_CACHE_TTL:
-                info["online"] = cached[1]
-            else:
-                needs_ping.append((port, info))
-
-    if needs_ping:
-        with ThreadPoolExecutor(max_workers=len(needs_ping)) as pool:
-            futures = {
-                pool.submit(check_instance_online, info["host"], port): (port, info)
-                for port, info in needs_ping
-            }
-            for future in as_completed(futures):
-                port, info = futures[future]
-                try:
-                    online = future.result()
-                except Exception:
-                    online = False
-                with _STATE_LOCK:
-                    _ONLINE_CACHE[port] = (time.monotonic(), online)
-                info["online"] = online
-
+    for info in instances.values():
+        _enrich_instance(info)
     return instances
 
 
 def get_target_instance() -> tuple[str, int] | None:
     """Resolve the instance to route a request to.
 
-    Returns None when there is no usable target. Crucially, an *explicitly*
-    selected instance that has gone offline returns None rather than silently
+    Returns None when there is no usable target. An *explicitly* selected
+    instance that is no longer registered returns None rather than silently
     rerouting to a different binary -- see _no_target_error_message for why.
+    A live but busy instance is still a valid target.
     """
     global ACTIVE_INSTANCE
 
@@ -207,26 +229,82 @@ def get_target_instance() -> tuple[str, int] | None:
         active = ACTIVE_INSTANCE
         explicit = ACTIVE_EXPLICIT
 
-    if active and active in instances and instances[active].get("online", False):
+    if active and active in instances:
         return (instances[active]["host"], active)
 
-    # Explicitly selected but unavailable: do NOT rebind to another binary.
+    # Explicitly selected but unregistered: do NOT rebind to another binary.
     if explicit:
         return None
 
-    # Auto mode only: fall back to the first online instance.
+    # Auto mode: first live-PID instance (busy still counts -- it is not down).
     for port, info in sorted(instances.items()):
-        if info.get("online", False):
-            with _STATE_LOCK:
-                ACTIVE_INSTANCE = port
-            return (info["host"], port)
+        with _STATE_LOCK:
+            ACTIVE_INSTANCE = port
+        return (info["host"], port)
 
     return None
 
 
+def _queue_brief(port: int) -> str:
+    """One-line queue snapshot from the plugin sidecar, or empty string."""
+    status = read_instance_status(port)
+    if not status:
+        return ""
+    parts = []
+    current = status.get("current") or {}
+    tool = current.get("tool")
+    if tool:
+        elapsed = current.get("elapsed_sec")
+        if isinstance(elapsed, (int, float)):
+            parts.append(f"running {tool} for {elapsed:.1f}s")
+        else:
+            parts.append(f"running {tool}")
+    queue = status.get("queue") or []
+    depth = status.get("queue_depth") or len(queue)
+    if depth:
+        names = ", ".join(str(q.get("tool") or "?") for q in queue)
+        parts.append(f"queued ({depth}): {names}" if names else f"queued ({depth})")
+    return "; ".join(parts)
+
+
+def _busy_message(port: int, exc: Exception | None = None) -> str:
+    """Tell the agent IDA is busy, not down, and what is in the queue."""
+    info = _read_registry().get(port) or {}
+    desc = info.get("description") or f"port {port}"
+    queue = _queue_brief(port)
+    text = (
+        f"IDA instance '{desc}' on port {port} is busy, not down. "
+        "The plugin process is still running; wait and retry the same call."
+    )
+    if queue:
+        text += f" Queue: {queue}."
+    else:
+        text += (
+            " It is not answering HTTP yet (usually a long decompile/search "
+            "holding the IDA main thread)."
+        )
+    if exc is not None:
+        text += f" ({type(exc).__name__}: {exc})"
+    return text
+
+
+def _proxy_failure_message(port: int, exc: Exception) -> str:
+    """Distinguish a dead plugin from a live-but-busy one."""
+    info = _read_registry().get(port)
+    pid = info.get("pid") if info else None
+    if isinstance(pid, int) and is_pid_alive(pid):
+        return _busy_message(port, exc)
+    shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
+    return (
+        f"Failed to connect to IDA Pro on port {port}! Did you run "
+        f"Edit -> Plugins -> MCP ({shortcut}) to start the server?\n"
+        f"{traceback.format_exc()}"
+    )
+
+
 def _no_target_error_message() -> str:
     """Human-readable reason there is no routable instance, distinguishing an
-    explicit-but-offline selection (data-safety guard) from 'nothing running'."""
+    explicit-but-unregistered selection (data-safety guard) from 'nothing running'."""
     shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
     with _STATE_LOCK:
         active = ACTIVE_INSTANCE
@@ -239,12 +317,7 @@ def _no_target_error_message() -> str:
                 f"(the IDB was likely closed). Use ida_list_instances then "
                 f"ida_select_instance to choose another."
             )
-        return (
-            f"The selected IDA instance '{info.get('description')}' on port {active} "
-            f"is offline. Because it was explicitly selected, requests are NOT "
-            f"auto-routed to a different binary (that would corrupt the wrong IDB). "
-            f"Restart that IDA's MCP server, or use ida_select_instance to switch."
-        )
+        return _busy_message(active)
     return (
         f"No IDA instances available. Open IDA and press {shortcut} to start the "
         f"MCP server."
@@ -252,11 +325,15 @@ def _no_target_error_message() -> str:
 
 
 def _instances_brief(instances: dict[int, InstanceInfo]) -> str:
-    """Compact 'port (description) [online]' listing for error messages."""
+    """Compact 'port (description) [status]' listing for error messages."""
     parts = []
     for port, info in sorted(instances.items()):
-        state = "online" if info.get("online", False) else "offline"
-        parts.append(f"{port} ({info.get('description')}) [{state}]")
+        state = info.get("status") or ("online" if info.get("online", False) else "offline")
+        extra = _queue_brief(port)
+        label = f"{port} ({info.get('description')}) [{state}]"
+        if extra:
+            label += f" {extra}"
+        parts.append(label)
     return ", ".join(parts) if parts else "(none)"
 
 
@@ -284,8 +361,6 @@ def resolve_instance(spec) -> tuple[tuple[str, int] | None, str | None]:
         info = instances.get(port)
         if info is None:
             return None, f"No IDA instance registered on port {port}. Available: {_instances_brief(instances)}"
-        if not info.get("online", False):
-            return None, f"IDA instance on port {port} ('{info.get('description')}') is offline. Available: {_instances_brief(instances)}"
         return (info["host"], port), None
 
     needle = str(spec).strip().lower()
@@ -294,12 +369,11 @@ def resolve_instance(spec) -> tuple[tuple[str, int] | None, str | None]:
     matches = [
         (p, i)
         for p, i in instances.items()
-        if i.get("online", False)
-        and (needle in (i.get("description") or "").lower()
-             or needle in (i.get("binary") or "").lower())
+        if (needle in (i.get("description") or "").lower()
+            or needle in (i.get("binary") or "").lower())
     ]
     if not matches:
-        return None, f"No online IDA instance matches '{spec}'. Available: {_instances_brief(instances)}"
+        return None, f"No IDA instance matches '{spec}'. Available: {_instances_brief(instances)}"
     if len(matches) > 1:
         cand = ", ".join(f"{p} ({i.get('description')})" for p, i in sorted(matches))
         return None, f"Instance '{spec}' is ambiguous -- matches: {cand}. Use a port number or a more specific substring."
@@ -371,27 +445,30 @@ def ida_select_instance(
             "available_ports": sorted(instances.keys()),
         }
 
-    info = instances[port]
-    online = check_instance_online(info["host"], port)
-    with _STATE_LOCK:
-        _ONLINE_CACHE[port] = (time.monotonic(), online)
-
-    if not online:
-        return {
-            "error": f"Instance on port {port} is offline",
-            "description": info.get("description", "Unknown"),
-        }
+    info = _enrich_instance(dict(instances[port]))
 
     with _STATE_LOCK:
         ACTIVE_INSTANCE = port
         ACTIVE_EXPLICIT = True
-    log.info("select_instance: port=%s desc=%s", port, info.get("description"))
-    return {
+    log.info(
+        "select_instance: port=%s desc=%s status=%s",
+        port, info.get("description"), info.get("status"),
+    )
+    result = {
         "success": True,
         "port": port,
         "description": info.get("description", "Unknown"),
         "idb_path": info.get("idb_path"),
+        "status": info.get("status", "online"),
+        "busy": bool(info.get("busy")),
     }
+    if info.get("busy"):
+        result["queue"] = _queue_brief(port)
+        result["message"] = (
+            f"Selected port {port}; IDA is busy, not down. "
+            f"{result['queue'] or 'Wait for the current tool to finish.'}"
+        )
+    return result
 
 
 @mcp.tool
@@ -412,12 +489,7 @@ def ida_get_active_instance() -> dict:
         # Explicitly selected instance is gone/offline -- report, do not rebind.
         return {"error": _no_target_error_message()}
     else:
-        # Auto-select first online instance
-        port = None
-        for p, info in sorted(instances.items()):
-            if info.get("online", False):
-                port = p
-                break
+        port = next(iter(sorted(instances)), None)
         if port is None:
             return {"error": _no_target_error_message()}
 
@@ -429,12 +501,48 @@ def ida_get_active_instance() -> dict:
         "idb_path": info.get("idb_path"),
         "input_file": info.get("input_file"),
         "online": info.get("online", False),
+        "status": info.get("status", "online"),
+        "busy": bool(info.get("busy")),
+        "current_tool": info.get("current_tool"),
+        "queue_depth": info.get("queue_depth") or 0,
+        "queue": info.get("queue") or [],
         "explicit": explicit and port == active,
     }
 
 
+@mcp.tool
+def ida_queue_status() -> list[dict]:
+    """Current in-flight MCP tool queue for every registered IDA instance.
+
+    Does not ping IDA. A live PID with a non-empty queue means IDA is working,
+    not down -- wait and retry rather than restarting the plugin.
+    """
+    instances = _read_registry()
+    result = []
+    for port, info in sorted(instances.items()):
+        item = _enrich_instance(dict(info))
+        result.append(
+            {
+                "port": port,
+                "description": item.get("description"),
+                "status": item.get("status"),
+                "busy": bool(item.get("busy")),
+                "current_tool": item.get("current_tool"),
+                "current_elapsed_sec": item.get("current_elapsed_sec"),
+                "queue_depth": item.get("queue_depth") or 0,
+                "queue": item.get("queue") or [],
+            }
+        )
+    return result
+
+
 # List of local management tool names
-LOCAL_TOOLS = {"ida_list_instances", "ida_select_instance", "ida_get_active_instance"}
+LOCAL_TOOLS = {
+    "ida_list_instances",
+    "ida_select_instance",
+    "ida_get_active_instance",
+    "ida_queue_status",
+}
 
 # Plugin-side instance tools that duplicate the proxy's LOCAL_TOOLS. The plugin's
 # select_instance can't actually reroute the proxy (selection lives here), so it
@@ -446,13 +554,61 @@ REDUNDANT_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 dispatch_original = mcp.registry.dispatch
 
 
-def proxy_to_ida(request: dict | str | bytes, host: str, port: int, inject_instance_info: bool = False) -> JsonRpcResponse | None:
+def _pid_for_port(port: int) -> int | None:
+    info = _read_registry().get(port)
+    if not info:
+        return None
+    pid = info.get("pid")
+    return pid if isinstance(pid, int) else None
+
+
+def _wait_for_tcp(host: str, port: int, pid: int | None, timeout: float) -> None:
+    """Wait until the plugin accepts a TCP connection, or raise TimeoutError.
+
+    A live PID that is not accepting is busy (GIL held / execute_sync), not
+    down. Callers must not treat this as a missing plugin.
+    """
+    if timeout <= 0:
+        return
+    deadline = time.monotonic() + timeout
+    last_exc: Exception | None = None
+    last_log = 0.0
+    while True:
+        if pid is not None and not is_pid_alive(pid):
+            raise ConnectionRefusedError(f"IDA process pid={pid} exited")
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return
+        except OSError as e:
+            last_exc = e
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                raise TimeoutError(_busy_message(port, last_exc)) from e
+            if now - last_log >= 5.0:
+                log.info(
+                    "proxy: waiting for IDA %s:%s to accept (%s)",
+                    host, port, _queue_brief(port) or "busy, not down",
+                )
+                last_log = now
+            time.sleep(min(0.5, remaining))
+
+
+def proxy_to_ida(
+    request: dict | str | bytes,
+    host: str,
+    port: int,
+    inject_instance_info: bool = False,
+    connect_wait: float | None = None,
+    timeout: float | None = None,
+) -> JsonRpcResponse | None:
     """Proxy a request to an IDA instance.
 
     Uses PROXY_TIMEOUT (default 180s, env-overridable) so heavy decompiles /
-    full analysis are not dropped as the old 30s would. Retries ONLY on
-    ConnectionRefusedError -- that is raised at connect time, before any bytes
-    are sent, so a write tool (rename/set_type/patch) can never be re-applied.
+    full analysis are not dropped as the old 30s would. Waits up to
+    PROXY_BUSY_CONNECT_WAIT for TCP accept while the plugin is alive but busy.
+    Retries ONLY on ConnectionRefusedError -- that is raised at connect time,
+    before any bytes are sent, so a write tool cannot be double-applied.
 
     If inject_instance_info is True, instance metadata is added to the response
     so the model knows which binary it queried.
@@ -464,9 +620,15 @@ def proxy_to_ida(request: dict | str | bytes, host: str, port: int, inject_insta
     else:
         body = bytes(request)
 
+    if connect_wait is None:
+        connect_wait = PROXY_BUSY_CONNECT_WAIT
+    http_timeout = PROXY_TIMEOUT if timeout is None else timeout
+    pid = _pid_for_port(port)
+    _wait_for_tcp(host, port, pid, connect_wait)
+
     last_exc: Exception | None = None
     for attempt in range(PROXY_CONNECT_RETRIES + 1):
-        conn = http.client.HTTPConnection(host, port, timeout=PROXY_TIMEOUT)
+        conn = http.client.HTTPConnection(host, port, timeout=http_timeout)
         try:
             # Enable extensions via query param (debugger tools enabled)
             conn.request("POST", "/mcp?ext=dbg", body, {"Content-Type": "application/json"})
@@ -488,6 +650,7 @@ def proxy_to_ida(request: dict | str | bytes, host: str, port: int, inject_insta
                             "port": port,
                             "description": instance_info.get("description"),
                             "idb_path": instance_info.get("idb_path"),
+                            "queue": _queue_brief(port) or None,
                         }
                     else:
                         instance_meta = {
@@ -548,10 +711,17 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         target = get_target_instance()
         if target:
             try:
-                ida_response = proxy_to_ida(request, target[0], target[1])
+                ida_response = proxy_to_ida(
+                    request, target[0], target[1], connect_wait=2.0, timeout=5.0
+                )
                 ida_tools = ida_response.get("result", {}).get("tools", []) if ida_response else []
                 # Drop plugin-side instance tools that duplicate the proxy's own.
                 ida_tools = [t for t in ida_tools if t.get("name") not in REDUNDANT_PLUGIN_TOOLS]
+                # Strip advertised outputSchema unless IDA_MCP_OUTPUT_SCHEMA=1: payloads
+                # carry extra runtime keys (e.g. _instance) that strict clients reject.
+                if os.environ.get("IDA_MCP_OUTPUT_SCHEMA") != "1":
+                    for t in ida_tools:
+                        t.pop("outputSchema", None)
                 # Advertise the optional per-call `instance` routing field on every
                 # proxied tool so agents can target an instance inline.
                 for t in ida_tools:
@@ -612,12 +782,11 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         except Exception as e:
             if request_id is None:
                 return None
-            shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
             return JsonRpcResponse({
                 "jsonrpc": "2.0",
                 "error": {
                     "code": -32000,
-                    "message": f"Failed to connect to IDA Pro on port {target[1]}! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{traceback.format_exc()}",
+                    "message": _proxy_failure_message(target[1], e),
                     "data": str(e),
                 },
                 "id": request_id,
@@ -642,12 +811,11 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     except Exception as e:
         if request_id is None:
             return None
-        shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
         return JsonRpcResponse({
             "jsonrpc": "2.0",
             "error": {
                 "code": -32000,
-                "message": f"Failed to connect to IDA Pro on port {target[1]}! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{traceback.format_exc()}",
+                "message": _proxy_failure_message(target[1], e),
                 "data": str(e),
             },
             "id": request_id,

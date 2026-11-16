@@ -36,8 +36,53 @@ def get_instances_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".ida-mcp", "instances")
 
 
+def get_status_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".ida-mcp", "status")
+
+
 def _instance_file_path(port: int) -> str:
     return os.path.join(get_instances_dir(), f"{port}.json")
+
+
+def _status_file_path(port: int) -> str:
+    return os.path.join(get_status_dir(), f"{port}.json")
+
+
+def write_instance_status(port: int, status: dict) -> None:
+    """Atomically write the in-flight queue snapshot for an instance."""
+    status_dir = get_status_dir()
+    os.makedirs(status_dir, exist_ok=True)
+    payload = dict(status)
+    payload["port"] = port
+    file_path = _status_file_path(port)
+    fd, tmp_path = tempfile.mkstemp(dir=status_dir, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def read_instance_status(port: int) -> dict | None:
+    """Read the queue snapshot written by the plugin. None if missing/corrupt."""
+    try:
+        with open(_status_file_path(port), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def clear_instance_status(port: int) -> None:
+    try:
+        os.unlink(_status_file_path(port))
+    except OSError:
+        pass
 
 
 def register_instance(
@@ -81,6 +126,7 @@ def register_instance(
 def unregister_instance(port: int) -> bool:
     """Remove an instance registration file. Returns True if removed."""
     file_path = _instance_file_path(port)
+    clear_instance_status(port)
     try:
         os.unlink(file_path)
         return True
@@ -157,18 +203,13 @@ def discover_instances() -> list[InstanceInfo]:
                 os.unlink(file_path)
             except OSError:
                 pass
+            clear_instance_status(int(info["port"]))
             continue
 
-        # Secondary check: verify the instance is actually listening.
-        # Catches PID reuse (Windows can recycle PIDs quickly) and
-        # cases where the process is alive but the server crashed.
-        if not probe_instance(info["host"], info["port"], timeout=1.0):
-            try:
-                os.unlink(file_path)
-            except OSError:
-                pass
-            continue
-
+        # A live PID whose TCP accept is slow is BUSY, not dead. A 1s probe
+        # timeout during a long decompile/search used to unlink the file and
+        # make agents think IDA was down. Keep the registration; callers that
+        # need reachability can probe separately.
         result.append(info)
 
     result.sort(key=lambda x: x.get("started_at", ""))

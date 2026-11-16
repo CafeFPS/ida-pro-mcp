@@ -139,11 +139,13 @@ def test_discover_cleans_up_missing_required_keys():
 
 
 @test()
-def test_discover_skips_alive_pid_unreachable_port():
-    """discover_instances removes entries with alive PID but no listening server."""
+def test_discover_keeps_alive_pid_unreachable_port():
+    """Live PID with no listener stays registered -- busy is not dead."""
     with _tmp_instances_dir():
         discovery.register_instance("127.0.0.1", 1, os.getpid(), "no_server.bin", "no.idb")
-        assert discovery.discover_instances() == []
+        results = discovery.discover_instances()
+        assert len(results) == 1
+        assert results[0]["port"] == 1
 
 
 @test()
@@ -156,6 +158,25 @@ def test_discover_returns_empty_when_dir_missing():
 # ---------------------------------------------------------------------------
 # Sort order — server.py picks instances[0], so order matters
 # ---------------------------------------------------------------------------
+
+
+@test()
+def test_status_sidecar_roundtrip():
+    """write/read/clear instance status uses a sidecar, not the registry file."""
+    with _tmp_instances_dir() as tmp:
+        orig = discovery.get_status_dir
+        discovery.get_status_dir = lambda: os.path.join(tmp, "status")
+        try:
+            discovery.write_instance_status(55020, {"busy": True, "queue_depth": 2})
+            data = discovery.read_instance_status(55020)
+            assert data is not None
+            assert data["busy"] is True
+            assert data["port"] == 55020
+            assert data["queue_depth"] == 2
+            discovery.clear_instance_status(55020)
+            assert discovery.read_instance_status(55020) is None
+        finally:
+            discovery.get_status_dir = orig
 
 
 @test()

@@ -95,6 +95,12 @@ def _sync_wrapper(ff, keep_batch=False):
             raise IDASyncError(error_str)
 
         call_stack.put((ff.__name__))
+        try:
+            from .queue_status import mark_running
+
+            mark_running()
+        except Exception:
+            pass
         old_batch = idc.batch(1)
         prev_pre_call = getattr(_sync_state, "pre_call_batch", None)
         _sync_state.pre_call_batch = old_batch
